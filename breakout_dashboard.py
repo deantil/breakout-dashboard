@@ -84,7 +84,7 @@ def parse_symbols(text, col):
     import io
     d = pd.read_csv(io.StringIO(text), sep="|", dtype=str)
     d = d[(d["Test Issue"] == "N") & (d["ETF"] == "N")]
-    return [x for x in d[col] if x.isalpha() and len(x) <= 5 and not (len(x) == 5 and x[-1] in "WRU")]
+    return [x for x in d[col].dropna().astype(str) if x.isalpha() and len(x) <= 5 and not (len(x) == 5 and x[-1] in "WRU")]
 
 
 def rsi(c, n=14):
@@ -195,54 +195,82 @@ def put_delta_abs(S, K, T, iv, r=0.04):
     return _N(-(math.log(S / K) + (r + iv * iv / 2) * T) / (iv * math.sqrt(T)))
 
 
-def fetch_puts(sym, dmin, dmax):
+def fetch_opts(sym, price, dmin, dmax, kind, diag):
     import yfinance as yf
-    t = yf.Ticker(sym)
-    h = t.history(period="5d")
-    if h.empty:
-        return []
-    price, today, earn, rows = float(h.Close.iloc[-1]), dt.date.today(), None, []
+    t, today = yf.Ticker(sym), dt.date.today()
     try:
-        ed = t.calendar.get("Earnings Date") if isinstance(t.calendar, dict) else None
+        exps = list(t.options)
+    except Exception as e:
+        diag[sym] = f"expiry list failed: {str(e)[:80]}"
+        return []
+    if not exps:
+        diag[sym] = "Yahoo returned no option expirations (blocked from this server, or not optionable)"
+        return []
+    use = [e for e in exps if dmin <= (dt.date.fromisoformat(e) - today).days <= dmax]
+    if not use:
+        diag[sym] = f"no expiry between {dmin} and {dmax} days (first available: {exps[:3]})"
+        return []
+    earn = None
+    try:
+        cal = t.calendar
+        ed = cal.get("Earnings Date") if isinstance(cal, dict) else None
         e = (ed[0] if isinstance(ed, (list, tuple)) else ed) if ed else None
         earn = e.date() if isinstance(e, dt.datetime) else e
     except Exception:
         pass
-    for exp in t.options:
-        d = dt.date.fromisoformat(exp)
-        if not dmin <= (d - today).days <= dmax:
+    rows = []
+    f = lambda x: 0.0 if x is None or x != x else float(x)
+    for exp in use:
+        try:
+            ch = t.option_chain(exp)
+        except Exception as e:
+            diag[sym] = f"chain failed: {str(e)[:80]}"
             continue
-        for r in t.option_chain(exp).puts.itertuples():
-            f = lambda x: 0.0 if x is None or x != x else float(x)
+        d = dt.date.fromisoformat(exp)
+        for r in (ch.puts if kind == "put" else ch.calls).itertuples():
             rows.append(dict(symbol=sym, price=price, expiry=d, dte=(d - today).days, strike=f(r.strike), bid=f(r.bid), ask=f(r.ask),
                              iv=f(r.impliedVolatility), oi=int(f(r.openInterest)), earnings=earn))
+    diag.setdefault(sym, f"{len(rows)} contracts")
     return rows
 
 
-def rank_puts(rows, p):
+def rank_opts(rows, p, kind):
     d = pd.DataFrame(rows)
     if d.empty:
         return d
-    d = d[(d.bid > 0) & (d.strike < d.price) & (d.dte > 0) & (d.iv > 0)].copy()
+    d = d[(d.bid > 0) & (d.dte > 0) & (d.iv > 0)]
+    d = (d[d.strike < d.price] if kind == "put" else d[d.strike > d.price]).copy()
     if d.empty:
         return d
     d["mid"] = (d.bid + d.ask) / 2
     d["spread%"] = (d.ask - d.bid) / d.mid * 100
-    d["cash"] = d.strike * 100
-    d["return%"] = d.bid / d.strike * 100
+    T = (d.dte / 365).values
+    if kind == "put":
+        d["cash"] = d.strike * 100
+        d["return%"] = d.bid / d.strike * 100
+        d["cushion%"] = (d.price - d.strike) / d.price * 100
+        d["breakeven"] = d.strike - d.bid
+        d["delta"] = [put_delta_abs(r.price, r.strike, t, r.iv) for r, t in zip(d.itertuples(), T)]
+        d["pop%"] = [put_pop(r.price, r.breakeven, t, r.iv) * 100 for r, t in zip(d.itertuples(), T)]
+        d["loss if -20% (USD)"] = (d.strike - d.price * 0.8 - d.bid).clip(lower=0) * 100
+    else:
+        d1 = lambda r, t: (math.log(r.price / r.strike) + (0.04 + r.iv ** 2 / 2) * t) / (r.iv * math.sqrt(t))
+        d["cash"] = d.price * 100
+        d["return%"] = d.bid / d.price * 100
+        d["cushion%"] = (d.strike - d.price) / d.price * 100
+        d["breakeven"] = d.price - d.bid
+        d["delta"] = [_N(d1(r, t)) for r, t in zip(d.itertuples(), T)]
+        d["pop%"] = [(1 - _N(d1(r, t) - r.iv * math.sqrt(t))) * 100 for r, t in zip(d.itertuples(), T)]
+        d["if called (%)"] = (d.strike - d.price + d.bid) / d.price * 100
+        d["loss if -20% (USD)"] = (d.price * 0.2 - d.bid).clip(lower=0) * 100
     d["per30%"] = d["return%"] * 30 / d.dte
-    d["cushion%"] = (d.price - d.strike) / d.price * 100
-    d["breakeven"] = d.strike - d.bid
-    d["delta"] = [put_delta_abs(r.price, r.strike, r.dte / 365, r.iv) for r in d.itertuples()]
-    d["pop%"] = [put_pop(r.price, r.breakeven, r.dte / 365, r.iv) * 100 for r in d.itertuples()]
-    d["loss if -20% (USD)"] = ((d.strike - d.price * 0.8 - d.bid).clip(lower=0) * 100)
     today = dt.date.today()
     d["earn"] = d.apply(lambda r: isinstance(r.earnings, dt.date) and today <= r.earnings <= r.expiry, axis=1)
     ok = ((d["pop%"] >= p["min_pop"]) & (d["per30%"] >= p["min_ret"]) & (d.delta <= p["max_delta"]) & (d.oi >= p["min_oi"])
           & (d["spread%"] <= p["max_spread"]) & (d.cash <= p["acct"] * p["max_pos"] / 100) & ~d.earn)
     cols = ["symbol", "price", "expiry", "dte", "strike", "bid", "pop%", "delta", "per30%", "return%", "cushion%", "breakeven",
-            "cash", "loss if -20% (USD)", "oi", "spread%"]
-    return d[ok].sort_values(["pop%", "per30%"], ascending=False)[cols].round(2)
+            "if called (%)", "cash", "loss if -20% (USD)", "oi", "spread%"]
+    return d[ok].sort_values(["pop%", "per30%"], ascending=False)[[c for c in cols if c in d.columns]].round(2)
 
 
 def main():
@@ -355,32 +383,54 @@ def main():
             f"Exit on a close below the 200-day average ({r['stop']}). This is slow compounding, not income or short-term trading."))
 
     with t4:
-        st.caption("Cash-secured puts ranked by the model's probability of profit (from implied volatility). Yahoo data, about 15 minutes delayed, so confirm prices in thinkorswim before trading.")
-        wl = st.text_area("Tickers (options scans are slow, keep it to about 25)", "F SOFI T PFE INTC SNAP AAL RIVN KEY HBAN WBD GRAB", height=60)
+        st.caption("Options income, ranked by the model's probability of profit (from implied volatility). Yahoo data, about 15 minutes delayed: confirm prices in thinkorswim before trading.")
+        kind_l = st.radio("Strategy", ["Cash-secured puts (you hold cash, get paid to wait)", "Covered calls (you already own 100 shares)"], horizontal=True)
+        kind = "put" if kind_l.startswith("Cash") else "call"
+        src = st.radio("Which stocks to scan", ["Type my own", "Most liquid stocks I can afford, from the universe scan above"], horizontal=True)
+        afford = acct * max_pos / 100 / 100
+        if src.startswith("Type"):
+            wl = st.text_area("Tickers (about 25 works best)", "F SOFI T PFE INTC SNAP AAL RIVN KEY HBAN WBD GRAB", height=60)
+            tk4 = wl.upper().replace(",", " ").split()[:60]
+        else:
+            nmax = st.slider("How many stocks", 10, 60, 25)
+            liq = {t: float((d.Close.tail(20) * d.Volume.tail(20)).mean()) for t, d in stocks.items() if d.Close.iloc[-1] <= afford}
+            tk4 = sorted(liq, key=liq.get, reverse=True)[:nmax]
+            st.caption(f"With your account and position limit, one contract can use at most {acct * max_pos / 100:,.0f} USD, so only stocks priced up to {afford:,.0f} USD qualify. "
+                       f"{len(liq)} stocks in your universe do. Scanning the {len(tk4)} most liquid: {' '.join(tk4)}")
         c = st.columns(4)
-        op = dict(acct=acct, max_pos=max_pos, min_pop=c[0].slider("Min probability of profit %", 50, 95, 75),
+        op = dict(acct=acct, max_pos=max_pos, min_pop=c[0].slider("Min probability %", 50, 95, 75),
                   min_ret=c[1].slider("Min return per 30 days %", 0.3, 5.0, 0.8, 0.1), max_delta=c[2].slider("Max delta", 0.05, 0.5, 0.30, 0.05))
         dmin, dmax = c[3].slider("Days to expiry", 7, 60, (25, 50))
         c = st.columns(2)
         op["min_oi"], op["max_spread"] = c[0].number_input("Min open interest", 0, 100000, 100), c[1].slider("Max bid/ask spread %", 1, 30, 10)
-        if st.button("Scan options now"):
-            rows, errs, tk4 = [], [], wl.upper().replace(",", " ").split()[:30]
-            bar = st.progress(0.0)
+        if st.button("Scan options now") and tk4:
+            rows, diag, bar = [], {}, st.progress(0.0)
             for i, sym in enumerate(tk4):
                 try:
-                    rows += fetch_puts(sym, dmin, dmax)
+                    px = float(stocks[sym].Close.iloc[-1]) if sym in stocks else float(yf.Ticker(sym).history(period="5d").Close.iloc[-1])
+                    rows += fetch_opts(sym, px, dmin, dmax, kind, diag)
                 except Exception as e:
-                    errs.append(f"{sym}: {e}")
+                    diag[sym] = f"error: {str(e)[:80]}"
                 bar.progress((i + 1) / len(tk4))
-            st.session_state["opt"] = (rank_puts(rows, op), errs, len(rows))
+            st.session_state["opt"] = (rank_opts(rows, op, kind), diag, len(rows), kind)
         if "opt" in st.session_state:
-            res4, errs, n4 = st.session_state["opt"]
-            st.caption(f"{n4} put contracts checked, {len(res4)} pass your filters (no earnings in the window, size within your position limit).")
-            st.dataframe(res4.head(40), use_container_width=True, hide_index=True)
-            if errs:
-                st.warning(" / ".join(errs[:5]))
-        st.info("Higher probability means a smaller premium, and the model ignores gaps. A 90% win rate can still lose money if the few losses are large: "
-                "check the 'loss if -20%' column. Premium above about 4% per 30 days usually signals a stock the market expects to move sharply.")
+            res4, diag, n4, k4 = st.session_state["opt"]
+            st.caption(f"{n4} contracts checked, {len(res4)} pass your filters (no earnings in the window, size within your limit). Sorted by probability, then return.")
+            if n4 == 0:
+                st.error("No option data came back. Open 'What happened per stock' below: if it says Yahoo returned no expirations, Yahoo is blocking options requests from this website's server.")
+            if len(res4):
+                st.markdown("**Best trades right now** (highest probability that also meets your minimum return):")
+                for _, r in res4.head(3).iterrows():
+                    what = f"sell the {r['expiry']} {r['strike']} put" if k4 == "put" else f"sell the {r['expiry']} {r['strike']} call"
+                    st.success(f"{r['symbol']}: {what} for {r['bid']} a share. About {r['pop%']:.0f}% chance of profit, {r['per30%']:.2f}% per 30 days, "
+                               f"{r['cash']:,.0f} USD tied up, about {r['loss if -20% (USD)']:,.0f} USD loss if the stock falls 20%.")
+                st.dataframe(res4, use_container_width=True, hide_index=True)
+                st.download_button("Download this list (CSV)", res4.to_csv(index=False), "options_scan.csv")
+            with st.expander("What happened per stock"):
+                st.write(diag)
+        st.info("Higher probability means a smaller premium, and the model ignores sudden gaps. A 90% win rate can still lose money if the few losses are large: "
+                "check the 'loss if -20%' column. For covered calls, 'probability' means the chance you keep your shares and the premium. "
+                "A premium above about 4% per 30 days usually signals a stock the market expects to move sharply.")
 
 
 if __name__ == "__main__":
