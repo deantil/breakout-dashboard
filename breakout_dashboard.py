@@ -3,6 +3,8 @@
 Run: pip install -r requirements.txt  then  streamlit run breakout_dashboard.py
 Daily data from Yahoo (free). Read-only: no orders. Educational, not financial advice.
 """
+import math
+import datetime as dt
 import numpy as np
 import pandas as pd
 
@@ -176,6 +178,73 @@ def render(st, res, data, show, key, plan):
         st.line_chart(d.tail(120))
 
 
+def _N(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def put_pop(S, BE, T, iv, r=0.04):
+    """Model probability the stock finishes above breakeven (profit), using implied volatility."""
+    if T <= 0 or iv <= 0 or BE <= 0:
+        return float("nan")
+    return _N((math.log(S / BE) + (r - iv * iv / 2) * T) / (iv * math.sqrt(T)))
+
+
+def put_delta_abs(S, K, T, iv, r=0.04):
+    if T <= 0 or iv <= 0:
+        return float("nan")
+    return _N(-(math.log(S / K) + (r + iv * iv / 2) * T) / (iv * math.sqrt(T)))
+
+
+def fetch_puts(sym, dmin, dmax):
+    import yfinance as yf
+    t = yf.Ticker(sym)
+    h = t.history(period="5d")
+    if h.empty:
+        return []
+    price, today, earn, rows = float(h.Close.iloc[-1]), dt.date.today(), None, []
+    try:
+        ed = t.calendar.get("Earnings Date") if isinstance(t.calendar, dict) else None
+        e = (ed[0] if isinstance(ed, (list, tuple)) else ed) if ed else None
+        earn = e.date() if isinstance(e, dt.datetime) else e
+    except Exception:
+        pass
+    for exp in t.options:
+        d = dt.date.fromisoformat(exp)
+        if not dmin <= (d - today).days <= dmax:
+            continue
+        for r in t.option_chain(exp).puts.itertuples():
+            f = lambda x: 0.0 if x is None or x != x else float(x)
+            rows.append(dict(symbol=sym, price=price, expiry=d, dte=(d - today).days, strike=f(r.strike), bid=f(r.bid), ask=f(r.ask),
+                             iv=f(r.impliedVolatility), oi=int(f(r.openInterest)), earnings=earn))
+    return rows
+
+
+def rank_puts(rows, p):
+    d = pd.DataFrame(rows)
+    if d.empty:
+        return d
+    d = d[(d.bid > 0) & (d.strike < d.price) & (d.dte > 0) & (d.iv > 0)].copy()
+    if d.empty:
+        return d
+    d["mid"] = (d.bid + d.ask) / 2
+    d["spread%"] = (d.ask - d.bid) / d.mid * 100
+    d["cash"] = d.strike * 100
+    d["return%"] = d.bid / d.strike * 100
+    d["per30%"] = d["return%"] * 30 / d.dte
+    d["cushion%"] = (d.price - d.strike) / d.price * 100
+    d["breakeven"] = d.strike - d.bid
+    d["delta"] = [put_delta_abs(r.price, r.strike, r.dte / 365, r.iv) for r in d.itertuples()]
+    d["pop%"] = [put_pop(r.price, r.breakeven, r.dte / 365, r.iv) * 100 for r in d.itertuples()]
+    d["loss if -20% (USD)"] = ((d.strike - d.price * 0.8 - d.bid).clip(lower=0) * 100)
+    today = dt.date.today()
+    d["earn"] = d.apply(lambda r: isinstance(r.earnings, dt.date) and today <= r.earnings <= r.expiry, axis=1)
+    ok = ((d["pop%"] >= p["min_pop"]) & (d["per30%"] >= p["min_ret"]) & (d.delta <= p["max_delta"]) & (d.oi >= p["min_oi"])
+          & (d["spread%"] <= p["max_spread"]) & (d.cash <= p["acct"] * p["max_pos"] / 100) & ~d.earn)
+    cols = ["symbol", "price", "expiry", "dte", "strike", "bid", "pop%", "delta", "per30%", "return%", "cushion%", "breakeven",
+            "cash", "loss if -20% (USD)", "oi", "spread%"]
+    return d[ok].sort_values(["pop%", "per30%"], ascending=False)[cols].round(2)
+
+
 def main():
     import requests
     import streamlit as st
@@ -236,7 +305,7 @@ def main():
             f"{'ABOVE: tailwind' if mkt else 'BELOW: be selective'}")
     base = dict(acct=acct, risk_pct=risk_pct, max_pos=max_pos, gate=(mkt or not gate))
     stocks = {t: d for t, d in data.items() if t != "SPY"}
-    t1, t2, t3 = st.tabs(["1. Qullamaggie breakout", "2. Nirvana-style trend", "3. Birbia-style compounder"])
+    t1, t2, t3, t4 = st.tabs(["1. Qullamaggie breakout", "2. Nirvana-style trend", "3. Birbia-style compounder", "4. Options income (puts)"])
 
     with t1:
         st.caption("Rules from the Financial Wisdom video on Kristjan Qullamaggie's breakout setup.")
@@ -284,6 +353,34 @@ def main():
         render(st, res, stocks, show, "k3", lambda r: (
             f"Hold about {r['shares']} shares (about {r['cost']:,} USD, one of {p['npos']} equal positions). Review monthly. "
             f"Exit on a close below the 200-day average ({r['stop']}). This is slow compounding, not income or short-term trading."))
+
+    with t4:
+        st.caption("Cash-secured puts ranked by the model's probability of profit (from implied volatility). Yahoo data, about 15 minutes delayed, so confirm prices in thinkorswim before trading.")
+        wl = st.text_area("Tickers (options scans are slow, keep it to about 25)", "F SOFI T PFE INTC SNAP AAL RIVN KEY HBAN WBD GRAB", height=60)
+        c = st.columns(4)
+        op = dict(acct=acct, max_pos=max_pos, min_pop=c[0].slider("Min probability of profit %", 50, 95, 75),
+                  min_ret=c[1].slider("Min return per 30 days %", 0.3, 5.0, 0.8, 0.1), max_delta=c[2].slider("Max delta", 0.05, 0.5, 0.30, 0.05))
+        dmin, dmax = c[3].slider("Days to expiry", 7, 60, (25, 50))
+        c = st.columns(2)
+        op["min_oi"], op["max_spread"] = c[0].number_input("Min open interest", 0, 100000, 100), c[1].slider("Max bid/ask spread %", 1, 30, 10)
+        if st.button("Scan options now"):
+            rows, errs, tk4 = [], [], wl.upper().replace(",", " ").split()[:30]
+            bar = st.progress(0.0)
+            for i, sym in enumerate(tk4):
+                try:
+                    rows += fetch_puts(sym, dmin, dmax)
+                except Exception as e:
+                    errs.append(f"{sym}: {e}")
+                bar.progress((i + 1) / len(tk4))
+            st.session_state["opt"] = (rank_puts(rows, op), errs, len(rows))
+        if "opt" in st.session_state:
+            res4, errs, n4 = st.session_state["opt"]
+            st.caption(f"{n4} put contracts checked, {len(res4)} pass your filters (no earnings in the window, size within your position limit).")
+            st.dataframe(res4.head(40), use_container_width=True, hide_index=True)
+            if errs:
+                st.warning(" / ".join(errs[:5]))
+        st.info("Higher probability means a smaller premium, and the model ignores gaps. A 90% win rate can still lose money if the few losses are large: "
+                "check the 'loss if -20%' column. Premium above about 4% per 30 days usually signals a stock the market expects to move sharply.")
 
 
 if __name__ == "__main__":
