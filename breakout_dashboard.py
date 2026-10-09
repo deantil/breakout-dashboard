@@ -280,7 +280,7 @@ def main():
     st.set_page_config(page_title="Stock Dashboard", layout="wide")
     st.title("Stock Dashboard: three rule sets")
     sb = sb_ = st.sidebar
-    mode = sb.radio("Universe", ["Starter list (55)", "Full US market (slow)", "My own list"])
+    mode = sb.radio("Universe", ["Starter list (55)", "Full US market (slow)", "My own list"], index=1)
     own = sb.text_area("Tickers (used by 'My own list')", DEFAULT, height=90)
     acct = sb.number_input("Account USD", 1000, 10_000_000, 10_000, 500)
     risk_pct = sb.slider("Risk per trade % of account", 0.25, 1.5, 1.0, 0.25)
